@@ -454,8 +454,12 @@ func (this *RockRadioPlayer) FetchChannelInfo() {
 func (this *RockRadioPlayer) Play() {
 	playUrl := "http:" + this.CurrentTrack.Url
 	mp3.PlayProcess(playUrl)
-	this.Status = STATUS_PLAY
-	Debug("Play sig.")
+	if this.Status == STATUS_PAUSE {
+		this.Pause()
+	} else {
+		this.Status = STATUS_PLAY
+		Debug("Play sig.")
+	}
 }
 
 // Pause playing.
