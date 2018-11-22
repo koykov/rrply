@@ -3,37 +3,36 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"log"
-	"os/user"
-	"github.com/BurntSushi/xgbutil"
-	"io/ioutil"
+	"bufio"
 	"encoding/json"
+	"flag"
+	"fmt"
+	"github.com/BurntSushi/xgbutil"
 	"github.com/BurntSushi/xgbutil/keybind"
 	"github.com/BurntSushi/xgbutil/xevent"
-	"sync"
-	"flag"
-	"os/signal"
-	"syscall"
-	"github.com/fsnotify/fsnotify"
-	"time"
-	"net/http"
-	"regexp"
 	"github.com/PuerkitoBio/goquery"
-	"strconv"
+	"github.com/adrg/libvlc-go"
+	"github.com/fsnotify/fsnotify"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"os/user"
 	"path"
-	"bufio"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
-
-	mp3 "github.com/koykov/mp3lib"
+	"sync"
+	"syscall"
+	"time"
 )
 
 const (
-	STATUS_PLAY   = 0x100
-	STATUS_PAUSE  = 0x200
-	STATUS_STOP   = 0x300
+	PLAY   = 0x100
+	PAUSE  = 0x200
+	STOP   = 0x300
 )
 
 // JSON types
@@ -46,24 +45,24 @@ type ChannelChunk struct {
 	Id					uint64 `json:"channel_id"`
 	Expiry				string `json:"expires_on"`
 	Length				float64
-	Tracks				[]ChannelChunk__Tracks `json:"tracks"`
+	Tracks				[]ChannelChunkTracks `json:"tracks"`
 }
 
-type ChannelChunk__Tracks struct {
+type ChannelChunkTracks struct {
 	Id					uint64 `json:"id"`
 	Artist				string `json:"display_artist"`
 	Title				string `json:"display_title"`
 	Album				string `json:"release"`
 	AlbumDate			string `json:"release_date"`
-	Content				ChannelChunk__Tracks__Content `json:"content"`
+	Content				ChannelChunkTracksContent `json:"content"`
 }
 
-type ChannelChunk__Tracks__Content struct {
+type ChannelChunkTracksContent struct {
 	Length				float64 `json:"length"`
-	Assets				[]ChannelChunk__Tracks__Content__Assets `json:"assets"`
+	Assets				[]ChannelChunkTracksContentAssets `json:"assets"`
 }
 
-type ChannelChunk__Tracks__Content__Assets struct {
+type ChannelChunkTracksContentAssets struct {
 	Url					string `json:"url"`
 }
 
@@ -71,11 +70,13 @@ type ChannelChunk__Tracks__Content__Assets struct {
 type RockRadioPlayer struct {
 	Channels			map[uint64]RockRadioPlayerChannel
 	CurrentChunk		ChannelChunk
-	CurrentTrack		ChannelChunk__Tracks__Content__Assets
+	CurrentTrack		ChannelChunkTracksContentAssets
 	CurrentChannel		uint64
 	AudioToken			string
 	Status				uint64
 	NextFetch			uint64
+	vlcPlayer			*vlc.Player
+	waitGroup			*sync.WaitGroup
 }
 
 type RockRadioPlayerChannel struct {
@@ -117,6 +118,9 @@ func init() {
 			log.Fatal("Cannot create cache diectory.")
 		}
 	}
+
+	// Initialize player.
+	rr.Init()
 }
 
 func main() {
@@ -129,8 +133,12 @@ func main() {
 
 	verbose = *verbosePtr
 
+	rr.waitGroup = &wg
 	// First fetch unique AudioToken. It have no sense to continue without it.
+	wg.Add(1)
 	rr.FetchAudioToken()
+
+	defer rr.ReleasePlayer()
 
 	// Make goroutine for final cleanup callback.
 	wg.Add(1)
@@ -200,7 +208,7 @@ func main() {
 			needRegenerate = true
 			Debug("Cache file %s doesn't exists, need generate.", cacheFile)
 		} else {
-			log.Fatal("Error when reading cache file: %s", err.Error())
+			log.Fatalf("Error when reading cache file: %s", err.Error())
 		}
 	}
 	if !needRegenerate {
@@ -216,7 +224,7 @@ func main() {
 		// Read channels and groups from the cache.
 		raw, err := ioutil.ReadFile(cacheFile)
 		if err != nil {
-			log.Fatal("Error reading cache file: %s", err.Error())
+			log.Fatalf("Error reading cache file: %s", err.Error())
 		}
 		rr.Channels = make(map[uint64]RockRadioPlayerChannel)
 		json.Unmarshal(raw, &rr.Channels)
@@ -257,7 +265,7 @@ func main() {
 
 	// Playing loop.
 	fmt.Printf("\nPlayng: %s\n", channel.Title)
-	for true {
+	for {
 		rr.FetchChannelInfo()
 		Debug("Fetch remote data %#v", rr.CurrentChunk)
 		Debug("Next fetch after %f seconds", rr.CurrentChunk.Length)
@@ -265,10 +273,12 @@ func main() {
 			rr.Stop()
 			fmt.Printf("%s - %s [%s] - %s\n", track.Artist, track.Title, track.Album, FormatTime(uint64(track.Content.Length)))
 			rr.CurrentTrack = track.Content.Assets[0] // @todo check next assets
+			wg.Add(1)
 			go rr.Play()
 			rr.Sleep(track.Content.Length)
 		}
 		// Get fresh audio token after playing the chunk. The old token may expire.
+		wg.Add(1)
 		go rr.FetchAudioToken()
 	}
 
@@ -332,7 +342,7 @@ func bindall(hotkeyConfig string, X *xgbutil.XUtil) (err error) {
 		log.Fatal("Could not find config file: ", err.Error())
 		return
 	}
-	hotkeys := []Hotkey{}
+	var hotkeys []Hotkey
 	err = json.Unmarshal(config, &hotkeys)
 	if err != nil {
 		log.Fatal("Could not parse config file: ", err.Error())
@@ -349,7 +359,7 @@ func bindall(hotkeyConfig string, X *xgbutil.XUtil) (err error) {
 func (hotkey Hotkey) attach(X *xgbutil.XUtil) {
 	err := keybind.KeyPressFun(
 		func(X *xgbutil.XUtil, e xevent.KeyPressEvent) {
-			if (rr.Status == STATUS_STOP || rr.Status == STATUS_PAUSE) {
+			if rr.Status == STOP || rr.Status == PAUSE {
 				go rr.Resume()
 			} else {
 				go rr.Pause()
@@ -374,8 +384,30 @@ func Debug(message string, a ...interface{}) {
 	}
 }
 
+// Initialize player instance.
+func (p *RockRadioPlayer) Init() {
+	var err error
+	if err := vlc.Init("--no-video", "--quiet"); err != nil {
+		log.Fatal(err)
+	}
+
+	p.vlcPlayer, err = vlc.NewPlayer()
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// Release player instance.
+func (p *RockRadioPlayer) ReleasePlayer() {
+	p.vlcPlayer.Stop()
+	p.vlcPlayer.Release()
+	vlc.Release()
+}
+
 // Fetch unique audio token from rockradio.com
-func (this *RockRadioPlayer) FetchAudioToken() {
+func (p *RockRadioPlayer) FetchAudioToken() {
+	defer p.waitGroup.Done()
+
 	response, err := http.Get("https://www.rockradio.com")
 	if err != nil {
 		log.Fatal(err)
@@ -389,30 +421,30 @@ func (this *RockRadioPlayer) FetchAudioToken() {
 		return
 	}
 
-	re := regexp.MustCompile(`"audio_token"\:"([a-z0-9]+)"`)
+	re := regexp.MustCompile(`"audio_token":"([a-z0-9]+)"`)
 	res := re.FindStringSubmatch(string(source))
 	if res == nil {
 		log.Fatal("Couldn't fetch AudioToken. Exiting.")
 	}
 
-	this.AudioToken = res[1]
-	Debug("Fetch AudioToken: %s", this.AudioToken)
+	p.AudioToken = res[1]
+	Debug("Fetch AudioToken: %s", p.AudioToken)
 }
 
 // Fetch channels from rockradio.com
-func (this *RockRadioPlayer) FetchChannels() {
+func (p *RockRadioPlayer) FetchChannels() {
 	doc, err := goquery.NewDocument("https://www.rockradio.com/")
 	if err != nil {
 		log.Fatal("Couldn't fetch channels: ", err.Error())
 	}
 
-	this.Channels = make(map[uint64]RockRadioPlayerChannel, 0)
+	p.Channels = make(map[uint64]RockRadioPlayerChannel, 0)
 	doc.Find("div.submenu.channels li").Each(func(i int, selection *goquery.Selection) {
 		id, exists := selection.Attr("data-channel-id")
 		title := selection.Find("a").Find("span").Text()
 		if exists {
 			cid, _ := strconv.ParseUint(path.Base(id), 0, 64)
-			this.Channels[cid] = RockRadioPlayerChannel{
+			p.Channels[cid] = RockRadioPlayerChannel{
 				cid, title,
 			}
 		}
@@ -420,13 +452,13 @@ func (this *RockRadioPlayer) FetchChannels() {
 }
 
 // Fetch channel info.
-func (this *RockRadioPlayer) FetchChannelInfo() {
-	if len(this.AudioToken) == 0 {
-		log.Fatal("Unknown AudioTocken. Call self.FetchAudioToken() first.")
+func (p *RockRadioPlayer) FetchChannelInfo() {
+	if len(p.AudioToken) == 0 {
+		log.Fatal("Unknown AudioToken. Call self.FetchAudioToken() first.")
 	}
 
 	ts := time.Now().UnixNano() / 1000000
-	channelUrl := fmt.Sprintf("https://www.rockradio.com/_papi/v1/rockradio/routines/channel/%d?audio_token=%s&_=%d", this.CurrentChannel, this.AudioToken, ts)
+	channelUrl := fmt.Sprintf("https://www.rockradio.com/_papi/v1/rockradio/routines/channel/%d?audio_token=%s&_=%d", p.CurrentChannel, p.AudioToken, ts)
 	response, err := http.Get(channelUrl)
 	if err != nil {
 		log.Fatal(err)
@@ -444,53 +476,63 @@ func (this *RockRadioPlayer) FetchChannelInfo() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	this.CurrentChunk = cc
-	for _, track := range this.CurrentChunk.Tracks {
-		this.CurrentChunk.Length += track.Content.Length
+	p.CurrentChunk = cc
+	for _, track := range p.CurrentChunk.Tracks {
+		p.CurrentChunk.Length += track.Content.Length
 	}
 }
 
 // Play channel.
-func (this *RockRadioPlayer) Play() {
-	playUrl := "http:" + this.CurrentTrack.Url
-	mp3.PlayProcess(playUrl)
-	if this.Status == STATUS_PAUSE {
-		this.Pause()
+func (p *RockRadioPlayer) Play() {
+	defer p.waitGroup.Done()
+
+	playUrl := "https:" + p.CurrentTrack.Url
+	media, err := p.vlcPlayer.LoadMediaFromURL(playUrl)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer media.Release()
+
+	err = p.vlcPlayer.Play()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if p.Status == PAUSE {
+		p.Pause()
 	} else {
-		this.Status = STATUS_PLAY
+		p.Status = PLAY
 		Debug("Play sig.")
 	}
 }
 
 // Pause playing.
-func (this *RockRadioPlayer) Pause() {
-	mp3.PauseProcess()
-	this.Status = STATUS_PAUSE
+func (p *RockRadioPlayer) Pause() {
+	p.vlcPlayer.SetPause(true)
+	p.Status = PAUSE
 	Debug("Pause sig.")
 }
 
 // Resume playing.
-func (this *RockRadioPlayer) Resume() {
-	mp3.ResumeProcess()
-	this.Status = STATUS_PLAY
+func (p *RockRadioPlayer) Resume() {
+	p.vlcPlayer.SetPause(false)
+	p.Status = PLAY
 	Debug("Resume sig.")
 }
 
 // Stop playing.
-func (this *RockRadioPlayer) Stop() {
-	// Call stop proc twice, just in case.
-	mp3.StopProcess()
-	mp3.StopProcess()
-	this.Status = STATUS_STOP
+func (p *RockRadioPlayer) Stop() {
+	p.vlcPlayer.Stop()
+	p.Status = STOP
 	Debug("Stop sig.")
 }
 
 // Sleep function, freezes duration increment on pause/stop status.
-func (this *RockRadioPlayer) Sleep(s float64) {
+func (p *RockRadioPlayer) Sleep(s float64) {
 	var counter float64
-	for true {
+	for {
 		time.Sleep(time.Second)
-		if this.Status == STATUS_PLAY {
+		if p.Status == PLAY {
 			counter += 1
 		}
 		if counter >= s {
