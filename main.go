@@ -15,6 +15,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -264,22 +265,46 @@ func main() {
 	channel := rr.Channels[rr.CurrentChannel]
 
 	// Playing loop.
+	var heartbeat, tickToken, tickTrack <-chan time.Time
 	fmt.Printf("\nPlayng: %s\n", channel.Title)
 	for {
 		rr.FetchChannelInfo()
 		Debug("Fetch remote data %#v", rr.CurrentChunk)
-		Debug("Next fetch after %f seconds", rr.CurrentChunk.Length)
+		Debug("Next fetch after %s", FormatTime(uint64(rr.CurrentChunk.Length)))
+
+		heartbeat = time.Tick(time.Second)
+		tickToken = time.After(time.Duration(math.Floor(rr.CurrentChunk.Length)) * time.Second)
+
 		for _, track := range rr.CurrentChunk.Tracks {
+			tickTrack = time.After(time.Duration(math.Floor(track.Content.Length)) * time.Second)
+
+			// Play current song.
 			rr.Stop()
 			fmt.Printf("%s - %s [%s] - %s\n", track.Artist, track.Title, track.Album, FormatTime(uint64(track.Content.Length)))
 			rr.CurrentTrack = track.Content.Assets[0] // @todo check next assets
 			wg.Add(1)
 			go rr.Play()
-			rr.Sleep(track.Content.Length)
+
+			goOut := false
+			for {
+				select {
+				case <-heartbeat:
+					// Well, just waste the time while player works.
+					time.Sleep(time.Second)
+				case <-tickTrack:
+					// Need to break the infinite loop.
+					goOut = true
+				case <-tickToken:
+					// We need fresh audio token.
+					wg.Add(1)
+					go rr.FetchAudioToken()
+				}
+
+				if goOut {
+					break
+				}
+			}
 		}
-		// Get fresh audio token after playing the chunk. The old token may expire.
-		wg.Add(1)
-		go rr.FetchAudioToken()
 	}
 
 	// Waiting for finishing all goroutines.
@@ -374,7 +399,11 @@ func (hotkey Hotkey) attach(X *xgbutil.XUtil) {
 func FormatTime(s uint64) (string) {
 	min := s / 60
 	sec := s % 60
-	return fmt.Sprintf("%d:%d", min, sec)
+	format := "%d:%d"
+	if sec < 10 {
+		format = "%d:0%d"
+	}
+	return fmt.Sprintf(format, min, sec)
 }
 
 // Print formatted debug message.
@@ -525,18 +554,4 @@ func (p *RockRadioPlayer) Stop() {
 	p.vlcPlayer.Stop()
 	p.Status = STOP
 	Debug("Stop sig.")
-}
-
-// Sleep function, freezes duration increment on pause/stop status.
-func (p *RockRadioPlayer) Sleep(s float64) {
-	var counter float64
-	for {
-		time.Sleep(time.Second)
-		if p.Status == PLAY {
-			counter += 1
-		}
-		if counter >= s {
-			break
-		}
-	}
 }
