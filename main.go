@@ -11,8 +11,8 @@ import (
 	"github.com/BurntSushi/xgbutil/keybind"
 	"github.com/BurntSushi/xgbutil/xevent"
 	"github.com/PuerkitoBio/goquery"
-	"github.com/adrg/libvlc-go"
 	"github.com/fsnotify/fsnotify"
+	"github.com/koykov/vlc"
 	"io/ioutil"
 	"log"
 	"math"
@@ -31,58 +31,58 @@ import (
 )
 
 const (
-	PLAY   = 0x100
-	PAUSE  = 0x200
-	STOP   = 0x300
+	PLAY  = 0x100
+	PAUSE = 0x200
+	STOP  = 0x300
 )
 
 // JSON types
 type Hotkey struct {
-	Key					string `json:"key"`
-	Desc				string `json:"desc"`
+	Key  string `json:"key"`
+	Desc string `json:"desc"`
 }
 
 type ChannelChunk struct {
-	Id					uint64 `json:"channel_id"`
-	Expiry				string `json:"expires_on"`
-	Length				float64
-	Tracks				[]ChannelChunkTracks `json:"tracks"`
+	Id     uint64 `json:"channel_id"`
+	Expiry string `json:"expires_on"`
+	Length float64
+	Tracks []ChannelChunkTracks `json:"tracks"`
 }
 
 type ChannelChunkTracks struct {
-	Id					uint64 `json:"id"`
-	Artist				string `json:"display_artist"`
-	Title				string `json:"display_title"`
-	Album				string `json:"release"`
-	AlbumDate			string `json:"release_date"`
-	Content				ChannelChunkTracksContent `json:"content"`
+	Id        uint64                    `json:"id"`
+	Artist    string                    `json:"display_artist"`
+	Title     string                    `json:"display_title"`
+	Album     string                    `json:"release"`
+	AlbumDate string                    `json:"release_date"`
+	Content   ChannelChunkTracksContent `json:"content"`
 }
 
 type ChannelChunkTracksContent struct {
-	Length				float64 `json:"length"`
-	Assets				[]ChannelChunkTracksContentAssets `json:"assets"`
+	Length float64                           `json:"length"`
+	Assets []ChannelChunkTracksContentAssets `json:"assets"`
 }
 
 type ChannelChunkTracksContentAssets struct {
-	Url					string `json:"url"`
+	Url string `json:"url"`
 }
 
 // General types
 type RockRadioPlayer struct {
-	Channels			map[uint64]RockRadioPlayerChannel
-	CurrentChunk		ChannelChunk
-	CurrentTrack		ChannelChunkTracksContentAssets
-	CurrentChannel		uint64
-	AudioToken			string
-	Status				uint64
-	NextFetch			uint64
-	vlcPlayer			*vlc.Player
-	waitGroup			*sync.WaitGroup
+	Channels       map[uint64]RockRadioPlayerChannel
+	CurrentChunk   ChannelChunk
+	CurrentTrack   ChannelChunkTracksContentAssets
+	CurrentChannel uint64
+	AudioToken     string
+	Status         uint64
+	NextFetch      uint64
+	vlcPlayer      *vlc.Vlc
+	waitGroup      *sync.WaitGroup
 }
 
 type RockRadioPlayerChannel struct {
-	Id					uint64 `json:"Id"`
-	Title				string `json:"Title"`
+	Id    uint64 `json:"Id"`
+	Title string `json:"Title"`
 }
 
 var rr RockRadioPlayer
@@ -228,7 +228,7 @@ func main() {
 			log.Fatalf("Error reading cache file: %s", err.Error())
 		}
 		rr.Channels = make(map[uint64]RockRadioPlayerChannel)
-		json.Unmarshal(raw, &rr.Channels)
+		_ = json.Unmarshal(raw, &rr.Channels)
 		Debug("Cache hit, reading file %s", cacheFile)
 	} else {
 		// Fetch channels and groups from 101.ru
@@ -353,8 +353,10 @@ func PutToFile(filename string, contents string) {
 	if err != nil {
 		log.Fatal("Error when file is created: ", err.Error())
 	}
-	defer file.Close()
-	file.WriteString(contents)
+	defer func() {
+		_ = file.Close()
+	}()
+	_, _ = file.WriteString(contents)
 	if err = file.Sync(); err != nil {
 		log.Fatal("Error when saving file: ", err.Error())
 	}
@@ -396,7 +398,7 @@ func (hotkey Hotkey) attach(X *xgbutil.XUtil) {
 }
 
 // Convert seconds to "mm:ss" time format.
-func FormatTime(s uint64) (string) {
+func FormatTime(s uint64) string {
 	min := s / 60
 	sec := s % 60
 	format := "%d:%d"
@@ -409,18 +411,14 @@ func FormatTime(s uint64) (string) {
 // Print formatted debug message.
 func Debug(message string, a ...interface{}) {
 	if verbose {
-		fmt.Println(fmt.Sprintf("Debug: " + message, a))
+		fmt.Println(fmt.Sprintf("Debug: "+message, a))
 	}
 }
 
 // Initialize player instance.
 func (p *RockRadioPlayer) Init() {
 	var err error
-	if err := vlc.Init("--no-video", "--quiet"); err != nil {
-		log.Fatal(err)
-	}
-
-	p.vlcPlayer, err = vlc.NewPlayer()
+	p.vlcPlayer, err = vlc.NewVlc([]string{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -428,9 +426,9 @@ func (p *RockRadioPlayer) Init() {
 
 // Release player instance.
 func (p *RockRadioPlayer) ReleasePlayer() {
-	p.vlcPlayer.Stop()
-	p.vlcPlayer.Release()
-	vlc.Release()
+	_ = p.vlcPlayer.Stop()
+	_ = p.vlcPlayer.Release()
+	_ = p.vlcPlayer.Release()
 }
 
 // Fetch unique audio token from rockradio.com
@@ -442,7 +440,9 @@ func (p *RockRadioPlayer) FetchAudioToken() {
 		log.Fatal(err)
 		return
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 
 	source, err := ioutil.ReadAll(response.Body)
 	if err != nil {
@@ -493,7 +493,9 @@ func (p *RockRadioPlayer) FetchChannelInfo() {
 		log.Fatal(err)
 		return
 	}
-	defer response.Body.Close()
+	defer func() {
+		_ = response.Body.Close()
+	}()
 
 	b, err := ioutil.ReadAll(response.Body)
 	if err != nil {
@@ -516,13 +518,7 @@ func (p *RockRadioPlayer) Play() {
 	defer p.waitGroup.Done()
 
 	playUrl := "https:" + p.CurrentTrack.Url
-	media, err := p.vlcPlayer.LoadMediaFromURL(playUrl)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer media.Release()
-
-	err = p.vlcPlayer.Play()
+	err := p.vlcPlayer.PlayURL(playUrl)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -537,21 +533,21 @@ func (p *RockRadioPlayer) Play() {
 
 // Pause playing.
 func (p *RockRadioPlayer) Pause() {
-	p.vlcPlayer.SetPause(true)
+	_ = p.vlcPlayer.Pause()
 	p.Status = PAUSE
 	Debug("Pause sig.")
 }
 
 // Resume playing.
 func (p *RockRadioPlayer) Resume() {
-	p.vlcPlayer.SetPause(false)
+	_ = p.vlcPlayer.Resume()
 	p.Status = PLAY
 	Debug("Resume sig.")
 }
 
 // Stop playing.
 func (p *RockRadioPlayer) Stop() {
-	p.vlcPlayer.Stop()
+	_ = p.vlcPlayer.Stop()
 	p.Status = STOP
 	Debug("Stop sig.")
 }
