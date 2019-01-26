@@ -1,6 +1,10 @@
-# rrply
+# rrply (deprecated and abandoned)
 Console player for rockradio.com online radio station.
 Made just for fun and personal comfort (avoid registration and advertising).
+
+## End of maintenance
+
+This project has moved to [conply](https://github.com/koykov/conply/rockradio).
 
 ## Preparation
 Before building the project you need to have libvlc-dev installed. On Debian/Ubuntu systems please execute:
